@@ -382,16 +382,23 @@ bool Deliminator::RemoveInequalityJoinWithDelimGet(LogicalComparisonJoin &delim_
 						join_comparison = ExpressionType::COMPARE_DISTINCT_FROM;
 					} else if (join_comparison != ExpressionType::COMPARE_DISTINCT_FROM &&
 					           join_comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-						// The optimization does not work here
-						found = false;
-						break;
+						// Ordering comparisons have no NULL-aware variant: only allow them if the outer column can't be
+						// NULL (inner NULLs are removed by the IS NOT NULL filter). SINGLE joins substitute the column,
+						// so equality only.
+						if (delim_join.join_type == JoinType::SINGLE ||
+						    !nullability.IsNotNull(*delim_join.children[0], delim_condition.GetLHS())) {
+							found = false;
+							break;
+						}
 					}
 				}
 				auto left_copy = delim_condition.LeftReference()->Copy();
 				auto right_copy = delim_condition.RightReference()->Copy();
 
-				rewritten_conditions[cond_idx] = JoinCondition(std::move(left_copy), std::move(right_copy),
-				                                               FlipComparisonExpression(join_comparison));
+				// Flip the comparison if the DelimGet is on the RHS of the join condition
+				rewritten_conditions[cond_idx] =
+				    JoinCondition(std::move(left_copy), std::move(right_copy),
+				                  delim_idx == 0 ? join_comparison : FlipComparisonExpression(join_comparison));
 				// join condition was a not equal and filtered out all NULLS.
 				// DELIM JOIN need to do that for not DELIM_GET side. Easiest way is to change the
 				// comparison expression type. See duckdb/duckdb#16803

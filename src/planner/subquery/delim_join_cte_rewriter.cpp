@@ -1296,15 +1296,23 @@ bool GeneratedDedupRefEliminator::RemoveInequalityJoinConditions(LogicalOperator
 						join_comparison = ExpressionType::COMPARE_DISTINCT_FROM;
 					} else if (join_comparison != ExpressionType::COMPARE_DISTINCT_FROM &&
 					           join_comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-						found = false;
-						break;
+						// Ordering comparisons have no NULL-aware variant: only allow them if the outer column can't be
+						// NULL (inner NULLs are removed by the IS NOT NULL filter). SINGLE joins substitute the column,
+						// so equality only.
+						if (delim_join.join_type == JoinType::SINGLE ||
+						    !nullability.IsNotNull(*delim_join.children[0], delim_condition.GetLHS())) {
+							found = false;
+							break;
+						}
 					}
 				}
 				auto left_copy = delim_condition.LeftReference()->Copy();
 				auto right_copy = delim_condition.RightReference()->Copy();
 
-				rewritten_conditions[cond_idx] = JoinCondition(std::move(left_copy), std::move(right_copy),
-				                                               FlipComparisonExpression(join_comparison));
+				// Flip the comparison if the dedup ref is on the RHS of the join condition
+				rewritten_conditions[cond_idx] =
+				    JoinCondition(std::move(left_copy), std::move(right_copy),
+				                  dedup_idx == 0 ? join_comparison : FlipComparisonExpression(join_comparison));
 				if (delim_join.join_type != JoinType::MARK &&
 				    original_join_comparison != ExpressionType::COMPARE_DISTINCT_FROM &&
 				    original_join_comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {

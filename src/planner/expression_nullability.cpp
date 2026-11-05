@@ -8,6 +8,7 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/operator/list.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 
 #include <algorithm>
@@ -182,6 +183,20 @@ bool NotNullExpressionAnalyzer::IsNotNull(LogicalOperator &op, const Expression 
 		}
 		return IsNotNull(*join.children[binding_child.GetIndex()], expr, seen_ctes);
 	}
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
+		// A cross product passes every row of both children through unchanged
+		ColumnBinding binding;
+		if (!GetColumnRefBinding(expr, binding)) {
+			return false;
+		}
+		for (auto &child : op.children) {
+			auto child_bindings = child->GetColumnBindings();
+			if (std::find(child_bindings.begin(), child_bindings.end(), binding) != child_bindings.end()) {
+				return IsNotNull(*child, expr, seen_ctes);
+			}
+		}
+		return false;
+	}
 	case LogicalOperatorType::LOGICAL_GET: {
 		ColumnBinding binding;
 		if (!GetColumnRefBinding(expr, binding)) {
@@ -199,16 +214,22 @@ bool NotNullExpressionAnalyzer::IsNotNull(LogicalOperator &op, const Expression 
 				return true;
 			}
 		}
-		auto table = get.GetTable();
-		if (!table) {
-			return false;
-		}
 		auto &column_index = get.GetColumnIndex(binding);
 		if (!column_index.HasPrimaryIndex() || column_index.HasChildren() ||
 		    column_index.GetPrimaryIndex() == DConstants::INVALID_INDEX) {
 			return false;
 		}
-		auto stats = table->GetStatistics(context, column_index.GetPrimaryIndex());
+		unique_ptr<BaseStatistics> stats;
+		auto table = get.GetTable();
+		if (table) {
+			stats = table->GetStatistics(context, column_index.GetPrimaryIndex());
+		} else if (get.bind_data && get.function.statistics_extended) {
+			// Table functions (e.g. Parquet scans) report column statistics too
+			TableFunctionGetStatisticsInput input(get.bind_data.get(), column_index);
+			stats = get.function.statistics_extended(context, input);
+		} else if (get.bind_data && get.function.statistics) {
+			stats = get.function.statistics(context, get.bind_data.get(), column_index.GetPrimaryIndex());
+		}
 		// unknown statistics must not count as proof of non-nullability
 		return stats && stats->CanHaveNoNull() && !stats->CanHaveNull();
 	}

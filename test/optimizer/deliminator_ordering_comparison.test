@@ -1,0 +1,201 @@
+# name: test/optimizer/deliminator_ordering_comparison.test
+# description: Correlated EXISTS with an equality plus an ordering comparison is decorrelated without a delim join when NULLs are ruled out
+# group: [optimizer]
+
+statement ok
+PRAGMA explain_output = PHYSICAL_ONLY;
+
+statement ok
+CREATE TABLE t AS SELECT i % 100 AS k, i AS ts FROM range(10000) r(i);
+
+statement ok
+CREATE TABLE w AS SELECT i % 100 AS k, (i * 997) % 10000 AS ts FROM range(1000) r(i);
+
+# no NULLs: the comparison becomes a join condition, no INNER join of all earlier rows
+query II
+EXPLAIN SELECT count(*) FROM w WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.k = w.k AND t.ts < w.ts);
+----
+physical_plan	<!REGEX>:.*INNER.*
+
+query I
+SELECT count(*) FROM w WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.k = w.k AND t.ts < w.ts);
+----
+6
+
+query I
+SELECT count(*) FROM w ANTI JOIN t ON t.k = w.k AND t.ts < w.ts;
+----
+6
+
+query I
+SELECT count(*) FROM w WHERE EXISTS (SELECT 1 FROM t WHERE t.k = w.k AND t.ts < w.ts);
+----
+994
+
+query I
+SELECT count(*) FROM w WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.k = w.k AND t.ts <= w.ts);
+----
+5
+
+query I
+SELECT count(*) FROM w WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.k = w.k AND w.ts > t.ts);
+----
+6
+
+query I
+SELECT count(*) FROM w WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.k = w.k AND t.ts >= w.ts);
+----
+4
+
+query I
+SELECT sum(CASE WHEN EXISTS (SELECT 1 FROM t WHERE t.k = w.k AND t.ts > w.ts) THEN 1 ELSE 0 END) FROM w;
+----
+996
+
+statement ok
+SET delim_join_as_cte = false;
+
+query I
+SELECT count(*) FROM w WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.k = w.k AND t.ts < w.ts);
+----
+6
+
+statement ok
+RESET delim_join_as_cte;
+
+# NULLs on either side: the rewrite must not change the answers
+statement ok
+CREATE TABLE tn AS SELECT CASE WHEN i % 97 = 0 THEN NULL ELSE i % 50 END AS k, CASE WHEN i % 89 = 0 THEN NULL ELSE i END AS ts, CASE WHEN i % 7 = 0 THEN NULL ELSE i % 13 END AS v FROM range(5000) r(i);
+
+statement ok
+CREATE TABLE wn AS SELECT i AS id, CASE WHEN i % 83 = 0 THEN NULL ELSE i % 50 END AS k, CASE WHEN i % 79 = 0 THEN NULL ELSE (i * 997) % 5000 END AS ts, CASE WHEN i % 5 = 0 THEN NULL ELSE i % 11 END AS v FROM range(2000) r(i);
+
+query I
+SELECT count(*) FROM wn WHERE NOT EXISTS (SELECT 1 FROM tn WHERE tn.k = wn.k AND tn.ts < wn.ts);
+----
+60
+
+query I
+SELECT count(*) FROM wn WHERE EXISTS (SELECT 1 FROM tn WHERE tn.k = wn.k AND tn.ts < wn.ts);
+----
+1940
+
+query I
+SELECT count(*) FROM wn WHERE NOT EXISTS (SELECT 1 FROM tn WHERE tn.k = wn.k AND tn.ts >= wn.ts AND tn.v < wn.v);
+----
+617
+
+query II
+SELECT sum(CASE WHEN EXISTS (SELECT 1 FROM tn WHERE tn.k = wn.k AND tn.ts > wn.ts) THEN 1 ELSE 0 END), count(*) FILTER (WHERE (EXISTS (SELECT 1 FROM tn WHERE tn.k = wn.k AND tn.ts > wn.ts)) IS NULL) FROM wn;
+----
+1940	0
+
+query I
+SELECT count(*) FROM wn WHERE NOT EXISTS (SELECT 1 FROM tn WHERE tn.k IS NOT DISTINCT FROM wn.k AND tn.ts < wn.ts);
+----
+37
+
+# nullable outer ordering key: the delim join (and its INNER join) stays
+query II
+EXPLAIN SELECT count(*) FROM wn WHERE NOT EXISTS (SELECT 1 FROM tn WHERE tn.k = wn.k AND tn.ts < wn.ts);
+----
+physical_plan	<REGEX>:.*INNER.*
+
+# non-NULL outer ordering key, NULLs on the inner side and in the equality keys: the rewrite fires and the
+# inner NULLs must not turn unmatched marks into NULL; checked with and without delim joins as CTEs
+statement ok
+CREATE TABLE ti AS SELECT CASE WHEN i % 7 = 0 THEN NULL ELSE i % 50 END AS k, CASE WHEN i % 11 = 0 THEN NULL ELSE i END AS ts, CASE WHEN i % 13 = 0 THEN NULL ELSE i % 17 END AS v FROM range(5000) r(i);
+
+statement ok
+CREATE TABLE wo AS SELECT i AS id, CASE WHEN i % 9 = 0 THEN NULL ELSE i % 50 END AS k, (i * 997) % 5000 AS ts, i % 19 AS v FROM range(2000) r(i);
+
+statement ok
+CREATE TABLE sw(k INT, ts INT);
+
+statement ok
+INSERT INTO sw VALUES (1, 10), (2, 3), (3, 20);
+
+statement ok
+CREATE TABLE st(k INT, ts INT);
+
+statement ok
+INSERT INTO st VALUES (1, 5), (2, 7), (3, 1), (3, 2);
+
+foreach cte false true
+
+statement ok
+SET delim_join_as_cte = {cte};
+
+query I
+SELECT count(*) FROM wo WHERE NOT EXISTS (SELECT 1 FROM ti WHERE ti.k = wo.k AND ti.ts < wo.ts);
+----
+237
+
+query I
+SELECT count(*) FROM wo WHERE EXISTS (SELECT 1 FROM ti WHERE ti.k = wo.k AND ti.ts < wo.ts);
+----
+1763
+
+query II
+SELECT sum(CASE WHEN EXISTS (SELECT 1 FROM ti WHERE ti.k = wo.k AND ti.ts > wo.ts) THEN 1 ELSE 0 END), count(*) FILTER (WHERE (NOT EXISTS (SELECT 1 FROM ti WHERE ti.k = wo.k AND ti.ts > wo.ts)) IS NULL) FROM wo;
+----
+1759	0
+
+query I
+SELECT count(*) FROM wo WHERE NOT EXISTS (SELECT 1 FROM ti WHERE ti.k = wo.k AND ti.ts < wo.ts AND ti.v >= wo.v);
+----
+474
+
+query I
+SELECT count(*) FROM wo WHERE NOT EXISTS (SELECT 1 FROM ti WHERE ti.k IS NOT DISTINCT FROM wo.k AND ti.ts < wo.ts);
+----
+16
+
+query I
+SELECT count(*) FROM wo WHERE wo.v IN (SELECT ti.v FROM ti WHERE ti.k = wo.k AND ti.ts < wo.ts);
+----
+1366
+
+query I
+SELECT count(*) FROM wo WHERE wo.v NOT IN (SELECT ti.v FROM ti WHERE ti.k = wo.k AND ti.ts < wo.ts);
+----
+345
+
+query I
+SELECT count(*) FROM wo WHERE wo.v = ANY (SELECT ti.v FROM ti WHERE ti.k = wo.k AND ti.ts > wo.ts);
+----
+1361
+
+query I
+SELECT count(*) FROM wo LEFT JOIN ti x ON x.ts = wo.ts AND x.ts < 0 WHERE NOT EXISTS (SELECT 1 FROM ti WHERE ti.k = wo.k AND ti.ts < coalesce(x.ts, wo.ts));
+----
+237
+
+query I
+SELECT count(*) FROM wo WHERE NOT EXISTS (SELECT 1 FROM ti WHERE ti.k = wo.k AND ti.ts < wo.ts AND false);
+----
+2000
+
+# scalar subqueries (SINGLE joins) must keep returning the outer value, not an inner one
+query I
+SELECT (SELECT sw.ts FROM st WHERE st.k = sw.k AND st.ts < sw.ts LIMIT 1) FROM sw ORDER BY sw.k;
+----
+10
+NULL
+20
+
+query I
+SELECT (SELECT sw.ts + st.ts FROM st WHERE st.k = sw.k AND st.ts < sw.ts ORDER BY st.ts LIMIT 1) FROM sw ORDER BY sw.k;
+----
+15
+NULL
+21
+
+query I
+SELECT (SELECT max(st.ts) FROM st WHERE st.k = sw.k AND st.ts < sw.ts) FROM sw ORDER BY sw.k;
+----
+5
+NULL
+2
+
+endloop
